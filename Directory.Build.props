@@ -1,9 +1,12 @@
 <Project>
 	<PropertyGroup>
-		<Version>1.0.1</Version>
+		<Version>2.0.0-beta3</Version>
 		<Nullable>enable</Nullable>
-		<Description>github定制版的dns服务，解析github最优的ip</Description>
-		<Copyright>https://github.com/xljiulang/FastGithub</Copyright>
+		<Description>github加速神器</Description>
+		<Copyright>https://github.com/dotnetcore/FastGithub</Copyright>
+		<RuntimeIdentifier>win-x64</RuntimeIdentifier>
+		<TargetFramework>net5.0</TargetFramework>
+		<DisableImplicitNamespaceImports>true</DisableImplicitNamespaceImports>
 	</PropertyGroup>
 
 	<PropertyGroup Condition="'$(Configuration)'=='Release'">
