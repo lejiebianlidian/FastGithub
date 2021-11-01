@@ -1,5 +1,4 @@
 ﻿using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
@@ -7,58 +6,50 @@ using System.Threading.Tasks;
 namespace FastGithub.DomainResolve
 {
     /// <summary>
-    /// DnscryptProxy后台服务
+    /// 域名解析后台服务
     /// </summary>
-    sealed class DnscryptProxyHostedService : BackgroundService
+    sealed class DomainResolveHostedService : BackgroundService
     {
-        private readonly ILogger<DnscryptProxyHostedService> logger;
         private readonly DnscryptProxy dnscryptProxy;
+        private readonly IDomainResolver domainResolver;
+        private readonly TimeSpan testPeriodTimeSpan = TimeSpan.FromSeconds (1d);
 
         /// <summary>
-        /// DnscryptProxy后台服务
+        /// 域名解析后台服务
         /// </summary>
         /// <param name="dnscryptProxy"></param>
-        /// <param name="logger"></param>
-        public DnscryptProxyHostedService(
+        /// <param name="domainResolver"></param>
+        public DomainResolveHostedService(
             DnscryptProxy dnscryptProxy,
-            ILogger<DnscryptProxyHostedService> logger)
+            IDomainResolver domainResolver)
         {
             this.dnscryptProxy = dnscryptProxy;
-            this.logger = logger;
+            this.domainResolver = domainResolver;
         }
 
         /// <summary>
-        /// 启动dnscrypt-proxy
+        /// 后台任务
         /// </summary>
         /// <param name="stoppingToken"></param>
         /// <returns></returns>
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            try
+            await this.dnscryptProxy.StartAsync(stoppingToken);
+            while (stoppingToken.IsCancellationRequested == false)
             {
-                await this.dnscryptProxy.StartAsync(stoppingToken);
-            }
-            catch (Exception ex)
-            {
-                this.logger.LogWarning($"{this.dnscryptProxy}启动失败：{ex.Message}");
+                await this.domainResolver.TestAllEndPointsAsync(stoppingToken);
+                await Task.Delay(this.testPeriodTimeSpan, stoppingToken);
             }
         }
 
         /// <summary>
-        /// 停止dnscrypt-proxy
+        /// 停止服务
         /// </summary>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
         public override Task StopAsync(CancellationToken cancellationToken)
         {
-            try
-            {
-                this.dnscryptProxy.Stop();
-            }
-            catch (Exception ex)
-            {
-                this.logger.LogWarning($"{this.dnscryptProxy}停止失败：{ex.Message}");
-            }
+            this.dnscryptProxy.Stop();
             return base.StopAsync(cancellationToken);
         }
     }

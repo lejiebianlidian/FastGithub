@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -13,17 +14,17 @@ namespace FastGithub.Configuration
         /// <summary>
         /// ssh端口
         /// </summary>
-        public static int Ssh { get; } = GetAvailableTcpPort(22);
+        public static int Ssh { get; } = OperatingSystem.IsWindows() ? GetAvailableTcpPort(22) : GetAvailableTcpPort(3822);
 
         /// <summary>
         /// http端口
         /// </summary>
-        public static int Http { get; } = GetAvailableTcpPort(80);
+        public static int Http { get; } = OperatingSystem.IsWindows() ? GetAvailableTcpPort(80) : GetAvailableTcpPort(3880);
 
         /// <summary>
         /// https端口
         /// </summary>
-        public static int Https { get; } = GetAvailableTcpPort(443);
+        public static int Https { get; } = OperatingSystem.IsWindows() ? GetAvailableTcpPort(443) : GetAvailableTcpPort(38443);
 
         /// <summary>
         /// 获取可用的随机Tcp端口

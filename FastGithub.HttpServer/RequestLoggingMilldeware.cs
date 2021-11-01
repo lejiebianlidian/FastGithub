@@ -3,8 +3,6 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using System;
 using System.Diagnostics;
-using System.IO;
-using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 
@@ -34,6 +32,8 @@ namespace FastGithub.HttpServer
         /// <returns></returns>
         public async Task InvokeAsync(HttpContext context, RequestDelegate next)
         {
+            var feature = new RequestLoggingFeature();
+            context.Features.Set<IRequestLoggingFeature>(feature);
             var stopwatch = Stopwatch.StartNew();
 
             try
@@ -45,16 +45,14 @@ namespace FastGithub.HttpServer
                 stopwatch.Stop();
             }
 
+            if (feature.Enable == false)
+            {
+                return;
+            }
+
             var request = context.Request;
             var response = context.Response;
             var message = $"{request.Method} {request.Scheme}://{request.Host}{request.Path} responded {response.StatusCode} in {stopwatch.Elapsed.TotalMilliseconds} ms";
-
-            var client = context.Connection.RemoteIpAddress;
-            if (IPAddress.Loopback.Equals(client) == false)
-            {
-                message = $"{client} {message}";
-            }
-
             var exception = context.GetForwarderErrorFeature()?.Exception;
             if (exception == null)
             {
@@ -82,12 +80,32 @@ namespace FastGithub.HttpServer
                 return false;
             }
 
-            if (exception is IOException ioException && ioException.InnerException is ConnectionAbortedException)
+            if (HasInnerException<ConnectionAbortedException>(exception))
             {
                 return false;
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// 是否有内部异常异常
+        /// </summary>
+        /// <typeparam name="TInnerException"></typeparam>
+        /// <param name="exception"></param>
+        /// <returns></returns>
+        private static bool HasInnerException<TInnerException>(Exception exception) where TInnerException : Exception
+        {
+            var inner = exception.InnerException;
+            while (inner != null)
+            {
+                if (inner is TInnerException)
+                {
+                    return true;
+                }
+                inner = inner.InnerException;
+            }
+            return false;
         }
 
         /// <summary>
@@ -103,10 +121,15 @@ namespace FastGithub.HttpServer
             while (ex != null)
             {
                 var type = ex.GetType();
-                builder.Append(type.Namespace).Append(".").Append(type.Name).Append(": ").AppendLine(ex.Message);
+                builder.Append(type.Namespace).Append('.').Append(type.Name).Append(": ").AppendLine(ex.Message);
                 ex = ex.InnerException;
             }
             return builder.ToString();
+        }
+
+        private class RequestLoggingFeature : IRequestLoggingFeature
+        {
+            public bool Enable { get; set; } = true;
         }
     }
 }

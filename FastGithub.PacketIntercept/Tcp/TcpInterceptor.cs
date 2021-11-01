@@ -1,11 +1,11 @@
-﻿using Microsoft.Extensions.Logging;
+﻿using FastGithub.WinDiverts;
+using Microsoft.Extensions.Logging;
 using System;
-using System.Buffers.Binary;
+using System.ComponentModel;
 using System.Net;
 using System.Runtime.Versioning;
 using System.Threading;
 using System.Threading.Tasks;
-using WinDivertSharp;
 
 namespace FastGithub.PacketIntercept.Tcp
 {
@@ -29,8 +29,8 @@ namespace FastGithub.PacketIntercept.Tcp
         public TcpInterceptor(int oldServerPort, int newServerPort, ILogger logger)
         {
             this.filter = $"loopback and (tcp.DstPort == {oldServerPort} or tcp.SrcPort == {newServerPort})";
-            this.oldServerPort = BinaryPrimitives.ReverseEndianness((ushort)oldServerPort);
-            this.newServerPort = BinaryPrimitives.ReverseEndianness((ushort)newServerPort);
+            this.oldServerPort = (ushort)oldServerPort;
+            this.newServerPort = (ushort)newServerPort;
             this.logger = logger;
         }
 
@@ -38,6 +38,7 @@ namespace FastGithub.PacketIntercept.Tcp
         /// 拦截指定端口的数据包
         /// </summary>
         /// <param name="cancellationToken"></param>
+        /// <exception cref="Win32Exception"></exception>
         public async Task InterceptAsync(CancellationToken cancellationToken)
         {
             if (this.oldServerPort == this.newServerPort)
@@ -48,12 +49,12 @@ namespace FastGithub.PacketIntercept.Tcp
             await Task.Yield();
 
             var handle = WinDivert.WinDivertOpen(this.filter, WinDivertLayer.Network, 0, WinDivertOpenFlags.None);
-            if (handle == IntPtr.MaxValue || handle == IntPtr.Zero)
+            if (handle == new IntPtr(unchecked((long)ulong.MaxValue)))
             {
-                return;
+                throw new Win32Exception();
             }
 
-            this.logger.LogInformation($"tcp://{IPAddress.Loopback}:{BinaryPrimitives.ReverseEndianness(this.oldServerPort)} => tcp://{IPAddress.Loopback}:{BinaryPrimitives.ReverseEndianness(this.newServerPort)}");
+            this.logger.LogInformation($"tcp://{IPAddress.Loopback}:{this.oldServerPort} => tcp://{IPAddress.Loopback}:{this.newServerPort}");
             cancellationToken.Register(hwnd => WinDivert.WinDivertClose((IntPtr)hwnd!), handle);
 
             var packetLength = 0U;
@@ -62,20 +63,22 @@ namespace FastGithub.PacketIntercept.Tcp
 
             while (cancellationToken.IsCancellationRequested == false)
             {
-                if (WinDivert.WinDivertRecv(handle, winDivertBuffer, ref winDivertAddress, ref packetLength))
+                if (WinDivert.WinDivertRecv(handle, winDivertBuffer, ref winDivertAddress, ref packetLength) == false)
                 {
-                    try
-                    {
-                        this.ModifyTcpPacket(winDivertBuffer, ref winDivertAddress, ref packetLength);
-                    }
-                    catch (Exception ex)
-                    {
-                        this.logger.LogWarning(ex.Message);
-                    }
-                    finally
-                    {
-                        WinDivert.WinDivertSend(handle, winDivertBuffer, packetLength, ref winDivertAddress);
-                    }
+                    throw new Win32Exception();
+                }
+
+                try
+                {
+                    this.ModifyTcpPacket(winDivertBuffer, ref winDivertAddress, ref packetLength);
+                }
+                catch (Exception ex)
+                {
+                    this.logger.LogWarning(ex.Message);
+                }
+                finally
+                {
+                    WinDivert.WinDivertSend(handle, winDivertBuffer, packetLength, ref winDivertAddress);
                 }
             }
         }

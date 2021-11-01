@@ -1,10 +1,11 @@
 ﻿using DNS.Protocol;
 using DNS.Protocol.ResourceRecords;
 using FastGithub.Configuration;
+using FastGithub.WinDiverts;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System;
-using System.Buffers.Binary;
+using System.ComponentModel;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Net;
@@ -12,7 +13,6 @@ using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Threading;
 using System.Threading.Tasks;
-using WinDivertSharp;
 
 namespace FastGithub.PacketIntercept.Dns
 {
@@ -23,15 +23,26 @@ namespace FastGithub.PacketIntercept.Dns
     sealed class DnsInterceptor : IDnsInterceptor
     {
         private const string DNS_FILTER = "udp.DstPort == 53";
+
         private readonly FastGithubConfig fastGithubConfig;
         private readonly ILogger<DnsInterceptor> logger;
-        private readonly TimeSpan ttl = TimeSpan.FromMinutes(10d);
+
+        private readonly TimeSpan ttl = TimeSpan.FromMinutes(1d);
 
         /// <summary>
         /// 刷新DNS缓存
         /// </summary>    
         [DllImport("dnsapi.dll", EntryPoint = "DnsFlushResolverCache", SetLastError = true)]
         private static extern void DnsFlushResolverCache();
+
+        /// <summary>
+        /// 首次加载驱动往往有异常，所以要提前加载
+        /// </summary>
+        static DnsInterceptor()
+        {
+            var handle = WinDivert.WinDivertOpen("false", WinDivertLayer.Network, 0, WinDivertOpenFlags.None);
+            WinDivert.WinDivertClose(handle);
+        }
 
         /// <summary>
         /// dns拦截器
@@ -54,15 +65,16 @@ namespace FastGithub.PacketIntercept.Dns
         /// DNS拦截
         /// </summary>
         /// <param name="cancellationToken"></param>
+        /// <exception cref="Win32Exception"></exception>
         /// <returns></returns>
         public async Task InterceptAsync(CancellationToken cancellationToken)
         {
             await Task.Yield();
 
             var handle = WinDivert.WinDivertOpen(DNS_FILTER, WinDivertLayer.Network, 0, WinDivertOpenFlags.None);
-            if (handle == IntPtr.MaxValue || handle == IntPtr.Zero)
+            if (handle == new IntPtr(unchecked((long)ulong.MaxValue)))
             {
-                return;
+                throw new Win32Exception();
             }
 
             cancellationToken.Register(hwnd =>
@@ -78,20 +90,22 @@ namespace FastGithub.PacketIntercept.Dns
             DnsFlushResolverCache();
             while (cancellationToken.IsCancellationRequested == false)
             {
-                if (WinDivert.WinDivertRecv(handle, winDivertBuffer, ref winDivertAddress, ref packetLength))
+                if (WinDivert.WinDivertRecv(handle, winDivertBuffer, ref winDivertAddress, ref packetLength) == false)
                 {
-                    try
-                    {
-                        this.ModifyDnsPacket(winDivertBuffer, ref winDivertAddress, ref packetLength);
-                    }
-                    catch (Exception ex)
-                    {
-                        this.logger.LogWarning(ex.Message);
-                    }
-                    finally
-                    {
-                        WinDivert.WinDivertSend(handle, winDivertBuffer, packetLength, ref winDivertAddress);
-                    }
+                    throw new Win32Exception();
+                }
+
+                try
+                {
+                    this.ModifyDnsPacket(winDivertBuffer, ref winDivertAddress, ref packetLength);
+                }
+                catch (Exception ex)
+                {
+                    this.logger.LogWarning(ex.Message);
+                }
+                finally
+                {
+                    WinDivert.WinDivertSend(handle, winDivertBuffer, packetLength, ref winDivertAddress);
                 }
             }
         }
@@ -115,7 +129,7 @@ namespace FastGithub.PacketIntercept.Dns
             }
 
             var question = request.Questions.First();
-            if (question.Type != RecordType.A)
+            if (question.Type != RecordType.A && question.Type != RecordType.AAAA)
             {
                 return;
             }
@@ -128,8 +142,11 @@ namespace FastGithub.PacketIntercept.Dns
 
             // dns响应数据
             var response = Response.FromRequest(request);
-            var record = new IPAddressResourceRecord(domain, IPAddress.Loopback, this.ttl);
-            response.AnswerRecords.Add(record);
+            if (question.Type == RecordType.A)
+            {
+                var record = new IPAddressResourceRecord(domain, IPAddress.Loopback, this.ttl);
+                response.AnswerRecords.Add(record);
+            }
             var responsePayload = response.ToArray();
 
             // 修改payload和包长 
@@ -137,40 +154,35 @@ namespace FastGithub.PacketIntercept.Dns
             packetLength = (uint)((int)packetLength + responsePayload.Length - requestPayload.Length);
 
             // 修改ip包
+            IPAddress destAddress;
             if (packet.IPv4Header != null)
             {
-                var destAddress = packet.IPv4Header->DstAddr;
+                destAddress = packet.IPv4Header->DstAddr;
                 packet.IPv4Header->DstAddr = packet.IPv4Header->SrcAddr;
                 packet.IPv4Header->SrcAddr = destAddress;
-                packet.IPv4Header->Length = BinaryPrimitives.ReverseEndianness((ushort)packetLength);
+                packet.IPv4Header->Length = (ushort)packetLength;
             }
             else
             {
-                var destAddress = packet.IPv6Header->DstAddr;
+                destAddress = packet.IPv6Header->DstAddr;
                 packet.IPv6Header->DstAddr = packet.IPv6Header->SrcAddr;
                 packet.IPv6Header->SrcAddr = destAddress;
-                packet.IPv6Header->Length = BinaryPrimitives.ReverseEndianness((ushort)packetLength);
+                packet.IPv6Header->Length = (ushort)packetLength;
             }
 
             // 修改udp包
             var destPort = packet.UdpHeader->DstPort;
             packet.UdpHeader->DstPort = packet.UdpHeader->SrcPort;
             packet.UdpHeader->SrcPort = destPort;
-            packet.UdpHeader->Length = BinaryPrimitives.ReverseEndianness((ushort)(sizeof(UdpHeader) + responsePayload.Length));
+            packet.UdpHeader->Length = (ushort)(sizeof(UdpHeader) + responsePayload.Length);
 
-            // 反转方向
             winDivertAddress.Impostor = true;
-            if (winDivertAddress.Direction == WinDivertDirection.Inbound)
-            {
-                winDivertAddress.Direction = WinDivertDirection.Outbound;
-            }
-            else
-            {
-                winDivertAddress.Direction = WinDivertDirection.Inbound;
-            }
+            winDivertAddress.Direction = winDivertAddress.Loopback
+                ? WinDivertDirection.Outbound
+                : WinDivertDirection.Inbound;
 
             WinDivert.WinDivertHelperCalcChecksums(winDivertBuffer, packetLength, ref winDivertAddress, WinDivertChecksumHelperParam.All);
-            this.logger.LogInformation($"{domain} => {IPAddress.Loopback}");
+            this.logger.LogInformation($"已拦截向dns://{destAddress}:{destPort}查询{domain}");
         }
 
 
