@@ -10,7 +10,6 @@ using System.Net.Http;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
-using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
@@ -109,7 +108,7 @@ namespace FastGithub.Http
                 catch (OperationCanceledException)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    innerExceptions.Add(new SocketException((int)SocketError.TimedOut));
+                    innerExceptions.Add(new HttpConnectTimeoutException(ipEndPoint.Address));
                 }
                 catch (Exception ex)
                 {
@@ -129,7 +128,7 @@ namespace FastGithub.Http
         /// <returns></returns>
         private async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, IPEndPoint ipEndPoint, CancellationToken cancellationToken)
         {
-            var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+            var socket = new Socket(ipEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             await socket.ConnectAsync(ipEndPoint, cancellationToken);
             var stream = new NetworkStream(socket, ownsSocket: true);
 
@@ -144,7 +143,6 @@ namespace FastGithub.Http
             await sslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
             {
                 TargetHost = tlsSniValue.Value,
-                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
                 RemoteCertificateValidationCallback = ValidateServerCertificate
             }, cancellationToken);
 
@@ -177,14 +175,18 @@ namespace FastGithub.Http
         /// <returns></returns>
         private async IAsyncEnumerable<IPEndPoint> GetIPEndPointsAsync(DnsEndPoint dnsEndPoint, [EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            if (IPAddress.TryParse(this.domainConfig.IPAddress, out var address) ||
-                IPAddress.TryParse(dnsEndPoint.Host, out address))
+            if (IPAddress.TryParse(dnsEndPoint.Host, out var address))
             {
                 yield return new IPEndPoint(address, dnsEndPoint.Port);
             }
             else
             {
-                await foreach (var item in this.domainResolver.ResolveAllAsync(dnsEndPoint, cancellationToken))
+                if (this.domainConfig.IPAddress != null)
+                {
+                    yield return new IPEndPoint(this.domainConfig.IPAddress, dnsEndPoint.Port);
+                }
+
+                await foreach (var item in this.domainResolver.ResolveAsync(dnsEndPoint, cancellationToken))
                 {
                     yield return new IPEndPoint(item, dnsEndPoint.Port);
                 }

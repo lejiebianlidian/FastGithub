@@ -1,7 +1,8 @@
 ﻿using LiveCharts;
+using LiveCharts.Configurations;
 using LiveCharts.Wpf;
+using Newtonsoft.Json;
 using System;
-using System.Collections.Generic;
 using System.Net.Http;
 using System.Threading.Tasks;
 using System.Windows.Controls;
@@ -17,21 +18,28 @@ namespace FastGithub.UI
         {
             Title = "上行速率",
             PointGeometry = null,
-            Values = new ChartValues<double>()
+            LineSmoothness = 1D,
+            Values = new ChartValues<RateTick>()
         };
 
         private readonly LineSeries writeSeries = new LineSeries()
         {
             Title = "下行速率",
             PointGeometry = null,
-            Values = new ChartValues<double>()
+            LineSmoothness = 1D,
+            Values = new ChartValues<RateTick>()
         };
 
-        public SeriesCollection Series { get; } = new SeriesCollection();
+        private static DateTime GetDateTime(double timestamp) => new DateTime(1970, 1, 1).Add(TimeSpan.FromMilliseconds(timestamp)).ToLocalTime();
 
-        public List<string> Labels { get; } = new List<string>();
+        private static double GetTimestamp(DateTime dateTime) => dateTime.ToUniversalTime().Subtract(new DateTime(1970, 1, 1)).TotalMilliseconds;
 
-        public Func<double, string> YFormatter { get; } = value => $"{FlowRate.ToNetworkSizeString((long)value)}/s";
+
+        public SeriesCollection Series { get; } = new SeriesCollection(Mappers.Xy<RateTick>().X(item => item.Timestamp).Y(item => item.Rate));
+
+        public Func<double, string> XFormatter { get; } = timestamp => GetDateTime(timestamp).ToString("HH:mm:ss");
+
+        public Func<double, string> YFormatter { get; } = value => $"{FlowStatistics.ToNetworkSizeString((long)value)}/s";
 
         public FlowChart()
         {
@@ -40,18 +48,18 @@ namespace FastGithub.UI
             this.Series.Add(this.readSeries);
             this.Series.Add(this.writeSeries);
 
-            DataContext = this;
-            this.InitFlowChart();
+            this.DataContext = this;
+            this.InitFlowChartAsync();
         }
 
-        private async void InitFlowChart()
+        private async void InitFlowChartAsync()
         {
-            var httpClient = new HttpClient();
-            while (true)
+            using var httpClient = new HttpClient();
+            while (this.Dispatcher.HasShutdownStarted == false)
             {
                 try
                 {
-                    await this.GetFlowRateAsync(httpClient);
+                    await this.FlushFlowStatisticsAsync(httpClient);
                 }
                 catch (Exception)
                 {
@@ -63,25 +71,42 @@ namespace FastGithub.UI
             }
         }
 
-        private async Task GetFlowRateAsync(HttpClient httpClient)
+        private async Task FlushFlowStatisticsAsync(HttpClient httpClient)
         {
-            var response = await httpClient.GetAsync("http://127.0.0.1/flowRates");
+            var response = await httpClient.GetAsync("http://localhost/flowStatistics");
             var json = await response.EnsureSuccessStatusCode().Content.ReadAsStringAsync();
-            var flowRate = Newtonsoft.Json.JsonConvert.DeserializeObject<FlowRate>(json);
+            var flowStatistics = JsonConvert.DeserializeObject<FlowStatistics>(json);
+            if (flowStatistics == null)
+            {
+                return;
+            }
 
-            this.textBlockRead.Text = FlowRate.ToNetworkSizeString(flowRate.TotalRead);
-            this.textBlockWrite.Text = FlowRate.ToNetworkSizeString(flowRate.TotalWrite);
+            this.textBlockRead.Text = FlowStatistics.ToNetworkSizeString(flowStatistics.TotalRead);
+            this.textBlockWrite.Text = FlowStatistics.ToNetworkSizeString(flowStatistics.TotalWrite);
 
-            this.readSeries.Values.Add(flowRate.ReadRate);
-            this.writeSeries.Values.Add(flowRate.WriteRate);
-            this.Labels.Add(DateTime.Now.ToString("HH:mm:ss"));
+            var timestamp = GetTimestamp(DateTime.Now);
+            this.readSeries.Values.Add(new RateTick(flowStatistics.ReadRate, timestamp));
+            this.writeSeries.Values.Add(new RateTick(flowStatistics.WriteRate, timestamp));
 
-            if (this.Labels.Count > 60)
+            if (this.readSeries.Values.Count > 60)
             {
                 this.readSeries.Values.RemoveAt(0);
                 this.writeSeries.Values.RemoveAt(0);
-                this.Labels.RemoveAt(0);
             }
         }
+
+        private class RateTick
+        {
+            public double Rate { get; }
+
+            public double Timestamp { get; }
+
+            public RateTick(double rate, double timestamp)
+            {
+                this.Rate = rate;
+                this.Timestamp = timestamp;
+            }
+        }
+
     }
 }

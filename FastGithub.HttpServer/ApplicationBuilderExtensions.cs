@@ -32,6 +32,24 @@ namespace FastGithub
         }
 
         /// <summary>
+        /// 禁用请求日志中间件
+        /// </summary>
+        /// <param name="app"></param>
+        /// <returns></returns>
+        public static IApplicationBuilder DisableRequestLogging(this IApplicationBuilder app)
+        {
+            return app.Use(next => context =>
+            {
+                var loggingFeature = context.Features.Get<IRequestLoggingFeature>();
+                if (loggingFeature != null)
+                {
+                    loggingFeature.Enable = false;
+                }
+                return next(context);
+            });
+        }
+
+        /// <summary>
         /// 使用反向代理中间件
         /// </summary>
         /// <param name="app"></param> 

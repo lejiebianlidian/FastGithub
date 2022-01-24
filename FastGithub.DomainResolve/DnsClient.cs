@@ -31,12 +31,17 @@ namespace FastGithub.DomainResolve
         private readonly ILogger<DnsClient> logger;
 
         private readonly ConcurrentDictionary<string, SemaphoreSlim> semaphoreSlims = new();
-        private readonly IMemoryCache dnsCache = new MemoryCache(Options.Create(new MemoryCacheOptions()));
-        private readonly TimeSpan defaultEmptyTtl = TimeSpan.FromSeconds(30d);
-        private readonly int resolveTimeout = (int)TimeSpan.FromSeconds(2d).TotalMilliseconds;
-        private static readonly TimeSpan maxConnectTimeout = TimeSpan.FromSeconds(2d);
+        private readonly IMemoryCache dnsStateCache = new MemoryCache(Options.Create(new MemoryCacheOptions()));
+        private readonly IMemoryCache dnsLookupCache = new MemoryCache(Options.Create(new MemoryCacheOptions()));
 
-        private record LookupResult(IPAddress[] Addresses, TimeSpan TimeToLive);
+        private readonly TimeSpan stateExpiration = TimeSpan.FromMinutes(5d);
+        private readonly TimeSpan minTimeToLive = TimeSpan.FromSeconds(30d);
+        private readonly TimeSpan maxTimeToLive = TimeSpan.FromMinutes(10d);
+
+        private readonly int resolveTimeout = (int)TimeSpan.FromSeconds(4d).TotalMilliseconds;
+        private static readonly TimeSpan tcpConnectTimeout = TimeSpan.FromSeconds(2d);
+
+        private record LookupResult(IList<IPAddress> Addresses, TimeSpan TimeToLive);
 
         /// <summary>
         /// DNS客户端
@@ -58,14 +63,15 @@ namespace FastGithub.DomainResolve
         /// 解析域名
         /// </summary>
         /// <param name="endPoint">远程结节</param>
+        /// <param name="fastSort">是否使用快速排序</param>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
-        public async IAsyncEnumerable<IPAddress> ResolveAsync(DnsEndPoint endPoint, [EnumeratorCancellation] CancellationToken cancellationToken)
+        public async IAsyncEnumerable<IPAddress> ResolveAsync(DnsEndPoint endPoint, bool fastSort, [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             var hashSet = new HashSet<IPAddress>();
-            foreach (var dns in this.GetDnsServers())
+            await foreach (var dns in this.GetDnsServersAsync(cancellationToken))
             {
-                var addresses = await this.LookupAsync(dns, endPoint, cancellationToken);
+                var addresses = await this.LookupAsync(dns, endPoint, fastSort, cancellationToken);
                 foreach (var address in addresses)
                 {
                     if (hashSet.Add(address) == true)
@@ -80,7 +86,7 @@ namespace FastGithub.DomainResolve
         /// 获取dns服务
         /// </summary>
         /// <returns></returns>
-        private IEnumerable<IPEndPoint> GetDnsServers()
+        private async IAsyncEnumerable<IPEndPoint> GetDnsServersAsync([EnumeratorCancellation] CancellationToken cancellationToken)
         {
             var cryptDns = this.dnscryptProxy.LocalEndPoint;
             if (cryptDns != null)
@@ -89,49 +95,49 @@ namespace FastGithub.DomainResolve
                 yield return cryptDns;
             }
 
-            foreach (var fallbackDns in this.fastGithubConfig.FallbackDns)
+            foreach (var dns in this.fastGithubConfig.FallbackDns)
             {
-                yield return fallbackDns;
+                if (await this.IsDnsAvailableAsync(dns, cancellationToken))
+                {
+                    yield return dns;
+                }
             }
         }
 
         /// <summary>
-        /// 解析域名
+        /// 获取dns是否可用
         /// </summary>
         /// <param name="dns"></param>
-        /// <param name="endPoint"></param>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
-        private async Task<IPAddress[]> LookupAsync(IPEndPoint dns, DnsEndPoint endPoint, CancellationToken cancellationToken = default)
+        private async ValueTask<bool> IsDnsAvailableAsync(IPEndPoint dns, CancellationToken cancellationToken)
         {
-            var key = $"{dns}/{endPoint}";
+            if (dns.Port != DNS_PORT)
+            {
+                return true;
+            }
+
+            if (this.dnsStateCache.TryGetValue<bool>(dns, out var available))
+            {
+                return available;
+            }
+
+            var key = dns.ToString();
             var semaphore = this.semaphoreSlims.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
             await semaphore.WaitAsync(CancellationToken.None);
 
             try
             {
-                if (this.dnsCache.TryGetValue<IPAddress[]>(key, out var value))
-                {
-                    return value;
-                }
-
-                var result = await this.LookupCoreAsync(dns, endPoint, cancellationToken);
-                this.dnsCache.Set(key, result.Addresses, result.TimeToLive);
-
-                var items = string.Join(", ", result.Addresses.Select(item => item.ToString()));
-                this.logger.LogInformation($"dns://{dns}：{endPoint.Host}->[{items}]");
-
-                return result.Addresses;
+                using var timeoutTokenSource = new CancellationTokenSource(tcpConnectTimeout);
+                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(timeoutTokenSource.Token, cancellationToken);
+                using var socket = new Socket(dns.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                await socket.ConnectAsync(dns, linkedTokenSource.Token);
+                return this.dnsStateCache.Set(dns, true, this.stateExpiration);
             }
-            catch (OperationCanceledException)
+            catch (Exception)
             {
-                this.logger.LogInformation($"dns://{dns}无法解析{endPoint.Host}：请求超时");
-                return Array.Empty<IPAddress>();
-            }
-            catch (Exception ex)
-            {
-                this.logger.LogInformation($"dns://{dns}无法解析{endPoint.Host}：{ex.Message}");
-                return Array.Empty<IPAddress>();
+                cancellationToken.ThrowIfCancellationRequested();
+                return this.dnsStateCache.Set(dns, false, this.stateExpiration);
             }
             finally
             {
@@ -144,53 +150,154 @@ namespace FastGithub.DomainResolve
         /// </summary>
         /// <param name="dns"></param>
         /// <param name="endPoint"></param>
+        /// <param name="fastSort"></param>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
-        private async Task<LookupResult> LookupCoreAsync(IPEndPoint dns, DnsEndPoint endPoint, CancellationToken cancellationToken = default)
+        private async Task<IList<IPAddress>> LookupAsync(IPEndPoint dns, DnsEndPoint endPoint, bool fastSort, CancellationToken cancellationToken = default)
+        {
+            var key = $"{dns}/{endPoint}";
+            var semaphore = this.semaphoreSlims.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+            await semaphore.WaitAsync(CancellationToken.None);
+
+            try
+            {
+                if (this.dnsLookupCache.TryGetValue<IList<IPAddress>>(key, out var value))
+                {
+                    return value;
+                }
+                var result = await this.LookupCoreAsync(dns, endPoint, fastSort, cancellationToken);
+                return this.dnsLookupCache.Set(key, result.Addresses, result.TimeToLive);
+            }
+            catch (OperationCanceledException)
+            {
+                return Array.Empty<IPAddress>();
+            }
+            catch (Exception ex)
+            {
+                this.logger.LogWarning($"{endPoint.Host}@{dns}->{ex.Message}");
+                var expiration = IsSocketException(ex) ? this.maxTimeToLive : this.minTimeToLive;
+                return this.dnsLookupCache.Set(key, Array.Empty<IPAddress>(), expiration);
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// 是否为Socket异常
+        /// </summary>
+        /// <param name="ex"></param>
+        /// <returns></returns>
+        private static bool IsSocketException(Exception ex)
+        {
+            if (ex is SocketException)
+            {
+                return true;
+            }
+
+            var inner = ex.InnerException;
+            return inner != null && IsSocketException(inner);
+        }
+
+
+        /// <summary>
+        /// 解析域名
+        /// </summary>
+        /// <param name="dns"></param>
+        /// <param name="endPoint"></param>
+        /// <param name="fastSort"></param>
+        /// <param name="cancellationToken"></param>
+        /// <returns></returns>
+        private async Task<LookupResult> LookupCoreAsync(IPEndPoint dns, DnsEndPoint endPoint, bool fastSort, CancellationToken cancellationToken = default)
         {
             if (endPoint.Host == LOCALHOST)
             {
-                return new LookupResult(new[] { IPAddress.Loopback }, TimeSpan.MaxValue);
+                var loopbacks = new List<IPAddress>();
+                if (Socket.OSSupportsIPv4 == true)
+                {
+                    loopbacks.Add(IPAddress.Loopback);
+                }
+                if (Socket.OSSupportsIPv6 == true)
+                {
+                    loopbacks.Add(IPAddress.IPv6Loopback);
+                }
+                return new LookupResult(loopbacks, TimeSpan.MaxValue);
             }
 
             var resolver = dns.Port == DNS_PORT
                 ? (IRequestResolver)new TcpRequestResolver(dns)
                 : new UdpRequestResolver(dns, new TcpRequestResolver(dns), this.resolveTimeout);
 
-            var request = new Request
-            {
-                RecursionDesired = true,
-                OperationCode = OperationCode.Query
-            };
-
-            request.Questions.Add(new Question(new Domain(endPoint.Host), RecordType.A));
-            var clientRequest = new ClientRequest(resolver, request);
-            var response = await clientRequest.Resolve(cancellationToken);
-
-            var addresses = response.AnswerRecords
-                .OfType<IPAddressResourceRecord>()
+            var addressRecords = await GetAddressRecordsAsync(resolver, endPoint.Host, cancellationToken);
+            var addresses = (IList<IPAddress>)addressRecords
                 .Where(item => IPAddress.IsLoopback(item.IPAddress) == false)
                 .Select(item => item.IPAddress)
                 .ToArray();
 
-            if (addresses.Length == 0)
+            if (addresses.Count == 0)
             {
-                return new LookupResult(addresses, this.defaultEmptyTtl);
+                return new LookupResult(addresses, this.minTimeToLive);
             }
 
-            if (addresses.Length > 1)
+            if (fastSort == true)
             {
                 addresses = await OrderByConnectAnyAsync(addresses, endPoint.Port, cancellationToken);
             }
 
-            var timeToLive = response.AnswerRecords.First().TimeToLive;
+            var timeToLive = addressRecords.Min(item => item.TimeToLive);
             if (timeToLive <= TimeSpan.Zero)
             {
-                timeToLive = this.defaultEmptyTtl;
+                timeToLive = this.minTimeToLive;
+            }
+            else if (timeToLive > this.maxTimeToLive)
+            {
+                timeToLive = this.maxTimeToLive;
             }
 
             return new LookupResult(addresses, timeToLive);
         }
+
+        /// <summary>
+        /// 获取IP记录
+        /// </summary>
+        /// <param name="resolver"></param>
+        /// <param name="domain"></param> 
+        /// <param name="cancellationToken"></param>
+        /// <returns></returns>
+        private static async Task<IList<IPAddressResourceRecord>> GetAddressRecordsAsync(IRequestResolver resolver, string domain, CancellationToken cancellationToken)
+        {
+            var addressRecords = new List<IPAddressResourceRecord>();
+            if (Socket.OSSupportsIPv4 == true)
+            {
+                var records = await GetRecordsAsync(RecordType.A);
+                addressRecords.AddRange(records);
+            }
+
+            if (Socket.OSSupportsIPv6 == true)
+            {
+                var records = await GetRecordsAsync(RecordType.AAAA);
+                addressRecords.AddRange(records);
+            }
+            return addressRecords;
+
+
+            async Task<IEnumerable<IPAddressResourceRecord>> GetRecordsAsync(RecordType recordType)
+            {
+                var request = new Request
+                {
+                    RecursionDesired = true,
+                    OperationCode = OperationCode.Query
+                };
+
+                request.Questions.Add(new Question(new Domain(domain), recordType));
+                var clientRequest = new ClientRequest(resolver, request);
+                var response = await clientRequest.Resolve(cancellationToken);
+                return response.AnswerRecords.OfType<IPAddressResourceRecord>();
+            }
+        }
+
+
         /// <summary>
         /// 连接速度排序
         /// </summary>
@@ -198,24 +305,34 @@ namespace FastGithub.DomainResolve
         /// <param name="port"></param>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
-        private static async Task<IPAddress[]> OrderByConnectAnyAsync(IPAddress[] addresses, int port, CancellationToken cancellationToken)
+        private static async Task<IList<IPAddress>> OrderByConnectAnyAsync(IList<IPAddress> addresses, int port, CancellationToken cancellationToken)
         {
-            var tasks = addresses.Select(address => ConnectAsync(address, port, cancellationToken));
-            var fastedAddress = await await Task.WhenAny(tasks);
-            if (fastedAddress == null)
+            if (addresses.Count <= 1)
             {
                 return addresses;
             }
 
-            var list = new List<IPAddress> { fastedAddress };
+            using var controlTokenSource = new CancellationTokenSource(tcpConnectTimeout);
+            using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, controlTokenSource.Token);
+
+            var connectTasks = addresses.Select(address => ConnectAsync(address, port, linkedTokenSource.Token));
+            var fastestAddress = await await Task.WhenAny(connectTasks);
+            controlTokenSource.Cancel();
+
+            if (fastestAddress == null || addresses.First().Equals(fastestAddress))
+            {
+                return addresses;
+            }
+
+            var list = new List<IPAddress> { fastestAddress };
             foreach (var address in addresses)
             {
-                if (address.Equals(fastedAddress) == false)
+                if (address.Equals(fastestAddress) == false)
                 {
                     list.Add(address);
                 }
             }
-            return list.ToArray();
+            return list;
         }
 
         /// <summary>
@@ -229,10 +346,8 @@ namespace FastGithub.DomainResolve
         {
             try
             {
-                using var timeoutTokenSource = new CancellationTokenSource(maxConnectTimeout);
-                using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutTokenSource.Token);
-                using var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
-                await socket.ConnectAsync(address, port, linkedTokenSource.Token);
+                using var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                await socket.ConnectAsync(address, port, cancellationToken);
                 return address;
             }
             catch (Exception)

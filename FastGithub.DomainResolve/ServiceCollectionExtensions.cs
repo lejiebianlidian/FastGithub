@@ -17,7 +17,9 @@ namespace FastGithub
         public static IServiceCollection AddDomainResolve(this IServiceCollection services)
         {
             services.TryAddSingleton<DnsClient>();
-            services.TryAddSingleton<DnscryptProxy>(); 
+            services.TryAddSingleton<DnscryptProxy>();
+            services.TryAddSingleton<PersistenceService>();
+            services.TryAddSingleton<IPAddressService>();
             services.TryAddSingleton<IDomainResolver, DomainResolver>();
             services.AddHostedService<DomainResolveHostedService>();
             return services;

@@ -7,10 +7,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System;
-using System.Linq;
-using System.Net;
-using System.Net.NetworkInformation;
-using System.Net.Sockets;
 
 namespace FastGithub
 {
@@ -39,43 +35,60 @@ namespace FastGithub
             var options = kestrel.ApplicationServices.GetRequiredService<IOptions<FastGithubOptions>>().Value;
             var httpProxyPort = options.HttpProxyPort;
 
-            if (CanListenTcp(httpProxyPort) == false)
+            if (GlobalListener.CanListenTcp(httpProxyPort) == false)
             {
                 throw new FastGithubException($"tcp端口{httpProxyPort}已经被其它进程占用，请在配置文件更换{nameof(FastGithubOptions.HttpProxyPort)}为其它端口");
             }
 
             var logger = kestrel.GetLogger();
-            kestrel.Listen(IPAddress.Loopback, httpProxyPort);
-            logger.LogInformation($"已监听http://{IPAddress.Loopback}:{httpProxyPort}，http代理服务启动完成");
+            kestrel.ListenLocalhost(httpProxyPort);
+            logger.LogInformation($"已监听http://localhost:{httpProxyPort}，http代理服务启动完成");
         }
 
         /// <summary>
-        /// 尝试监听ssh反向代理
+        /// 监听ssh反向代理
         /// </summary>
         /// <param name="kestrel"></param>
         public static void ListenSshReverseProxy(this KestrelServerOptions kestrel)
         {
-            var sshPort = ReverseProxyPort.Ssh;
-            kestrel.Listen(IPAddress.Loopback, sshPort, listen => listen.UseConnectionHandler<SshReverseProxyHandler>());
-
-            if (OperatingSystem.IsWindows())
+            var sshPort = GlobalListener.SshPort;
+            kestrel.ListenLocalhost(sshPort, listen =>
             {
-                kestrel.GetLogger().LogInformation($"已监听ssh://{IPAddress.Loopback}:{sshPort}，github的ssh反向代理服务启动完成");
-            }
+                listen.UseFlowAnalyze();
+                listen.UseConnectionHandler<GithubSshReverseProxyHandler>();
+            });
+
+            kestrel.GetLogger().LogInformation($"已监听ssh://localhost:{sshPort}，github的ssh反向代理服务启动完成");
         }
 
         /// <summary>
-        /// 尝试监听http反向代理
+        /// 监听git反向代理
+        /// </summary>
+        /// <param name="kestrel"></param>
+        public static void ListenGitReverseProxy(this KestrelServerOptions kestrel)
+        {
+            var gitPort = GlobalListener.GitPort;
+            kestrel.ListenLocalhost(gitPort, listen =>
+            {
+                listen.UseFlowAnalyze();
+                listen.UseConnectionHandler<GithubGitReverseProxyHandler>();
+            });
+
+            kestrel.GetLogger().LogInformation($"已监听git://localhost:{gitPort}，github的git反向代理服务启动完成");
+        }
+
+        /// <summary>
+        /// 监听http反向代理
         /// </summary>
         /// <param name="kestrel"></param>
         public static void ListenHttpReverseProxy(this KestrelServerOptions kestrel)
         {
-            var httpPort = ReverseProxyPort.Http;
-            kestrel.Listen(IPAddress.Loopback, httpPort);
+            var httpPort = GlobalListener.HttpPort;
+            kestrel.ListenLocalhost(httpPort);
 
             if (OperatingSystem.IsWindows())
             {
-                kestrel.GetLogger().LogInformation($"已监听http://{IPAddress.Loopback}:{httpPort}，http反向代理服务启动完成");
+                kestrel.GetLogger().LogInformation($"已监听http://localhost:{httpPort}，http反向代理服务启动完成");
             }
         }
 
@@ -90,8 +103,8 @@ namespace FastGithub
             certService.CreateCaCertIfNotExists();
             certService.InstallAndTrustCaCert();
 
-            var httpsPort = ReverseProxyPort.Https;
-            kestrel.Listen(IPAddress.Loopback, httpsPort, listen =>
+            var httpsPort = GlobalListener.HttpsPort;
+            kestrel.ListenLocalhost(httpsPort, listen =>
             {
                 if (OperatingSystem.IsWindows())
                 {
@@ -106,7 +119,7 @@ namespace FastGithub
             if (OperatingSystem.IsWindows())
             {
                 var logger = kestrel.GetLogger();
-                logger.LogInformation($"已监听https://{IPAddress.Loopback}:{httpsPort}，https反向代理服务启动完成");
+                logger.LogInformation($"已监听https://localhost:{httpsPort}，https反向代理服务启动完成");
             }
         }
 
@@ -119,18 +132,6 @@ namespace FastGithub
         {
             var loggerFactory = kestrel.ApplicationServices.GetRequiredService<ILoggerFactory>();
             return loggerFactory.CreateLogger($"{nameof(FastGithub)}.{nameof(HttpServer)}");
-        }
-
-        /// <summary>
-        /// 是否可以监听指定tcp端口
-        /// </summary>
-        /// <param name="port"></param>
-        /// <param name="addressFamily"></param>
-        /// <returns></returns>
-        private static bool CanListenTcp(int port, AddressFamily addressFamily = AddressFamily.InterNetwork)
-        {
-            var tcpListeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners();
-            return tcpListeners.Any(item => item.AddressFamily == addressFamily && item.Port == port) == false;
         }
     }
 }

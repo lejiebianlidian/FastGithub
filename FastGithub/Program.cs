@@ -2,8 +2,10 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Hosting;
 using Serilog;
+using Serilog.Sinks.Network;
 using System;
 using System.IO;
+using System.Net;
 
 namespace FastGithub
 {
@@ -15,6 +17,7 @@ namespace FastGithub
         /// <param name="args"></param>
         public static void Main(string[] args)
         {
+            ConsoleUtil.DisableQuickEdit();
             CreateHostBuilder(args).Build().Run();
         }
 
@@ -27,6 +30,7 @@ namespace FastGithub
         {
             return Host
                 .CreateDefaultBuilder(args)
+                .UseSystemd()
                 .UseWindowsService()
                 .UseDefaultServiceProvider(c =>
                 {
@@ -44,6 +48,18 @@ namespace FastGithub
                         }
                     }
                 })
+                .UseSerilog((hosting, logger) =>
+                {
+                    var template = "{Timestamp:O} [{Level:u3}]{NewLine}{SourceContext}{NewLine}{Message:lj}{NewLine}{Exception}{NewLine}";
+                    logger
+                        .ReadFrom.Configuration(hosting.Configuration)
+                        .Enrich.FromLogContext()
+                        .WriteTo.Console(outputTemplate: template)
+                        .WriteTo.File(Path.Combine("logs", @"log.txt"), rollingInterval: RollingInterval.Day, outputTemplate: template);
+
+                    var udpLoggerPort = hosting.Configuration.GetValue(nameof(AppOptions.UdpLoggerPort), 38457);
+                    logger.WriteTo.UDPSink(IPAddress.Loopback, udpLoggerPort);
+                })
                 .ConfigureWebHostDefaults(webBuilder =>
                 {
                     webBuilder.UseStartup<Startup>();
@@ -57,20 +73,12 @@ namespace FastGithub
                         if (OperatingSystem.IsWindows())
                         {
                             kestrel.ListenSshReverseProxy();
+                            kestrel.ListenGitReverseProxy();
                         }
                         else
                         {
                             kestrel.ListenHttpProxy();
                         }
-                    });
-                    webBuilder.UseSerilog((hosting, logger) =>
-                    {
-                        var template = "{Timestamp:O} [{Level:u3}]{NewLine}{SourceContext}{NewLine}{Message:lj}{NewLine}{Exception}{NewLine}";
-                        logger
-                            .ReadFrom.Configuration(hosting.Configuration)
-                            .Enrich.FromLogContext()
-                            .WriteTo.Console(outputTemplate: template)
-                            .WriteTo.File(Path.Combine("logs", @"log.txt"), rollingInterval: RollingInterval.Day, outputTemplate: template);
                     });
                 });
         }

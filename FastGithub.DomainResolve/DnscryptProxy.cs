@@ -1,15 +1,13 @@
 ﻿using FastGithub.Configuration;
 using Microsoft.Extensions.Logging;
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Net.NetworkInformation;
-using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using static PInvoke.AdvApi32;
 
 namespace FastGithub.DomainResolve
 {
@@ -18,10 +16,11 @@ namespace FastGithub.DomainResolve
     /// </summary>
     sealed class DnscryptProxy
     {
-        private const string PATH = "dnscrypt-proxy";
-        private const string NAME = "dnscrypt-proxy";
-
         private readonly ILogger<DnscryptProxy> logger;
+        private readonly string processName;
+        private readonly string serviceName;
+        private readonly string exeFilePath;
+        private readonly string tomlFilePath;
 
         /// <summary>
         /// 相关进程
@@ -39,7 +38,14 @@ namespace FastGithub.DomainResolve
         /// <param name="logger"></param>
         public DnscryptProxy(ILogger<DnscryptProxy> logger)
         {
+            const string PATH = "dnscrypt-proxy";
+            const string NAME = "dnscrypt-proxy";
+
             this.logger = logger;
+            this.processName = NAME;
+            this.serviceName = $"{nameof(FastGithub)}.{NAME}";
+            this.exeFilePath = Path.Combine(PATH, OperatingSystem.IsWindows() ? $"{NAME}.exe" : NAME);
+            this.tomlFilePath = Path.Combine(PATH, $"{NAME}.toml");
         }
 
         /// <summary>
@@ -55,7 +61,7 @@ namespace FastGithub.DomainResolve
             }
             catch (Exception ex)
             {
-                this.logger.LogWarning($"{NAME}启动失败：{ex.Message}");
+                this.logger.LogWarning($"{this.processName}启动失败：{ex.Message}");
             }
         }
 
@@ -66,36 +72,30 @@ namespace FastGithub.DomainResolve
         /// <returns></returns>
         private async Task StartCoreAsync(CancellationToken cancellationToken)
         {
-            var tomlPath = Path.Combine(PATH, $"{NAME}.toml");
-            var port = GetAvailablePort(IPAddress.Loopback.AddressFamily);
+            var port = GlobalListener.GetAvailablePort(5533);
             var localEndPoint = new IPEndPoint(IPAddress.Loopback, port);
 
-            await TomlUtil.SetListensAsync(tomlPath, localEndPoint, cancellationToken);
-            await TomlUtil.SetEdnsClientSubnetAsync(tomlPath, cancellationToken);
+            await TomlUtil.SetListensAsync(this.tomlFilePath, localEndPoint, cancellationToken);
+            await TomlUtil.SetLogLevelAsync(this.tomlFilePath, 6, cancellationToken);
+            await TomlUtil.SetLBStrategyAsync(this.tomlFilePath, "ph", cancellationToken);
+            await TomlUtil.SetMinMaxTTLAsync(this.tomlFilePath, TimeSpan.FromMinutes(1d), TimeSpan.FromMinutes(2d), cancellationToken);
 
-            foreach (var process in Process.GetProcessesByName(NAME))
+            if (OperatingSystem.IsWindows() && Environment.UserInteractive == false)
             {
-                process.Kill();
-                process.WaitForExit();
-            }
-
-            if (OperatingSystem.IsWindows())
-            {
-                StartDnscryptProxy("-service uninstall")?.WaitForExit();
-                StartDnscryptProxy("-service install")?.WaitForExit();
-                StartDnscryptProxy("-service start")?.WaitForExit();
-                this.process = Process.GetProcessesByName(NAME).FirstOrDefault(item => item.SessionId == 0);
+                ServiceInstallUtil.StopAndDeleteService(this.serviceName);
+                ServiceInstallUtil.InstallAndStartService(this.serviceName, this.exeFilePath, ServiceStartType.SERVICE_DEMAND_START);
+                this.process = Process.GetProcessesByName(this.processName).FirstOrDefault(item => item.SessionId == 0);
             }
             else
             {
-                this.process = StartDnscryptProxy(string.Empty);
+                this.process = StartDnscryptProxy();
             }
 
             if (this.process != null)
             {
                 this.LocalEndPoint = localEndPoint;
                 this.process.EnableRaisingEvents = true;
-                this.process.Exited += Process_Exited;
+                this.process.Exited += (s, e) => this.LocalEndPoint = null;
             }
         }
 
@@ -106,11 +106,11 @@ namespace FastGithub.DomainResolve
         {
             try
             {
-                if (OperatingSystem.IsWindows())
+                if (OperatingSystem.IsWindows() && Environment.UserInteractive == false)
                 {
-                    StartDnscryptProxy("-service stop")?.WaitForExit();
-                    StartDnscryptProxy("-service uninstall")?.WaitForExit();
+                    ServiceInstallUtil.StopAndDeleteService(this.serviceName);
                 }
+
                 if (this.process != null && this.process.HasExited == false)
                 {
                     this.process.Kill();
@@ -118,7 +118,7 @@ namespace FastGithub.DomainResolve
             }
             catch (Exception ex)
             {
-                this.logger.LogWarning($"{NAME}停止失败：{ex.Message }");
+                this.logger.LogWarning($"{this.processName}停止失败：{ex.Message }");
             }
             finally
             {
@@ -127,58 +127,15 @@ namespace FastGithub.DomainResolve
         }
 
         /// <summary>
-        /// 获取可用的随机端口
-        /// </summary>
-        /// <param name="addressFamily"></param>
-        /// <param name="min">最小值</param>
-        /// <returns></returns>
-        private static int GetAvailablePort(AddressFamily addressFamily, int min = 5533)
-        {
-            var hashSet = new HashSet<int>();
-            var tcpListeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners();
-            var udpListeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveUdpListeners();
-
-            foreach (var endPoint in tcpListeners.Concat(udpListeners))
-            {
-                if (endPoint.AddressFamily == addressFamily)
-                {
-                    hashSet.Add(endPoint.Port);
-                }
-            }
-
-            for (var port = min; port < IPEndPoint.MaxPort; port++)
-            {
-                if (hashSet.Contains(port) == false)
-                {
-                    return port;
-                }
-            }
-
-            throw new FastGithubException("当前无可用的端口");
-        }
-
-        /// <summary>
-        /// 进程退出时
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        private void Process_Exited(object? sender, EventArgs e)
-        {
-            this.LocalEndPoint = null;
-        }
-
-        /// <summary>
         /// 启动DnscryptProxy进程
-        /// </summary>
-        /// <param name="arguments"></param> 
-        private static Process? StartDnscryptProxy(string arguments)
+        /// </summary> 
+        /// <returns></returns>
+        private Process? StartDnscryptProxy()
         {
-            var fileName = OperatingSystem.IsWindows() ? $"{NAME}.exe" : NAME;
             return Process.Start(new ProcessStartInfo
             {
-                FileName = Path.Combine(PATH, fileName),
-                Arguments = arguments,
-                WorkingDirectory = PATH,
+                FileName = this.exeFilePath,
+                WorkingDirectory = Path.GetDirectoryName(this.exeFilePath),
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 WindowStyle = ProcessWindowStyle.Hidden
@@ -191,7 +148,7 @@ namespace FastGithub.DomainResolve
         /// <returns></returns>
         public override string ToString()
         {
-            return NAME;
+            return this.processName;
         }
     }
 }

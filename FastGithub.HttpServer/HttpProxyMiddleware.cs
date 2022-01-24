@@ -4,12 +4,17 @@ using Microsoft.AspNetCore.Connections.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
+using System;
+using System.Collections.Generic;
+using System.IO;
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Yarp.ReverseProxy.Forwarder;
 
@@ -20,7 +25,6 @@ namespace FastGithub.HttpServer
     /// </summary>
     sealed class HttpProxyMiddleware
     {
-        private const string LOOPBACK = "127.0.0.1";
         private const string LOCALHOST = "localhost";
         private const int HTTP_PORT = 80;
         private const int HTTPS_PORT = 443;
@@ -31,6 +35,7 @@ namespace FastGithub.HttpServer
         private readonly HttpReverseProxyMiddleware httpReverseProxy;
 
         private readonly HttpMessageInvoker defaultHttpClient;
+        private readonly TimeSpan connectTimeout = TimeSpan.FromSeconds(10d);
 
         static HttpProxyMiddleware()
         {
@@ -84,10 +89,8 @@ namespace FastGithub.HttpServer
             }
             else if (context.Request.Method == HttpMethods.Connect)
             {
-                var endpoint = await this.GetTargetEndPointAsync(host);
-                using var targetSocket = new Socket(SocketType.Stream, ProtocolType.Tcp);
-                await targetSocket.ConnectAsync(endpoint);
-
+                var cancellationToken = context.RequestAborted;
+                using var connection = await this.CreateConnectionAsync(host, cancellationToken);
                 var responseFeature = context.Features.Get<IHttpResponseFeature>();
                 if (responseFeature != null)
                 {
@@ -99,16 +102,17 @@ namespace FastGithub.HttpServer
                 var transport = context.Features.Get<IConnectionTransportFeature>()?.Transport;
                 if (transport != null)
                 {
-                    var targetStream = new NetworkStream(targetSocket, ownsSocket: false);
-                    await Task.WhenAny(targetStream.CopyToAsync(transport.Output), transport.Input.CopyToAsync(targetStream));
+                    var task1 = connection.CopyToAsync(transport.Output, cancellationToken);
+                    var task2 = transport.Input.CopyToAsync(connection, cancellationToken);
+                    await Task.WhenAny(task1, task2);
                 }
             }
             else
             {
-                await this.httpReverseProxy.InvokeAsync(context, async ctx =>
+                await this.httpReverseProxy.InvokeAsync(context, async next =>
                 {
-                    var destinationPrefix = $"{ctx.Request.Scheme}://{ctx.Request.Host}";
-                    await this.httpForwarder.SendAsync(ctx, destinationPrefix, this.defaultHttpClient);
+                    var destinationPrefix = $"{context.Request.Scheme}://{context.Request.Host}";
+                    await this.httpForwarder.SendAsync(context, destinationPrefix, this.defaultHttpClient);
                 });
             }
         }
@@ -120,7 +124,17 @@ namespace FastGithub.HttpServer
         /// <returns></returns>
         private bool IsFastGithubServer(HostString host)
         {
-            return host.Port == this.fastGithubConfig.HttpProxyPort && (host.Host == LOOPBACK || host.Host == LOCALHOST);
+            if (host.Port != this.fastGithubConfig.HttpProxyPort)
+            {
+                return false;
+            }
+
+            if (host.Host == LOCALHOST)
+            {
+                return true;
+            }
+
+            return IPAddress.TryParse(host.Host, out var address) && IPAddress.IsLoopback(address);
         }
 
         /// <summary>
@@ -143,39 +157,70 @@ namespace FastGithub.HttpServer
         }
 
         /// <summary>
+        /// 创建连接
+        /// </summary>
+        /// <param name="host"></param>
+        /// <param name="cancellationToken"></param>
+        /// <returns></returns>
+        /// <exception cref="AggregateException"></exception>
+        private async Task<Stream> CreateConnectionAsync(HostString host, CancellationToken cancellationToken)
+        {
+            var innerExceptions = new List<Exception>();
+            await foreach (var endPoint in this.GetUpstreamEndPointsAsync(host, cancellationToken))
+            {
+                var socket = new Socket(SocketType.Stream, ProtocolType.Tcp);
+                try
+                {
+                    using var timeoutTokenSource = new CancellationTokenSource(this.connectTimeout);
+                    using var linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutTokenSource.Token);
+                    await socket.ConnectAsync(endPoint, linkedTokenSource.Token);
+                    return new NetworkStream(socket, ownsSocket: false);
+                }
+                catch (Exception ex)
+                {
+                    socket.Dispose();
+                    cancellationToken.ThrowIfCancellationRequested();
+                    innerExceptions.Add(ex);
+                }
+            }
+            throw new AggregateException($"无法连接到{host}", innerExceptions);
+        }
+
+        /// <summary>
         /// 获取目标终节点
         /// </summary>
         /// <param name="host"></param>
+        /// <param name="cancellationToken"></param>
         /// <returns></returns>
-        private async Task<EndPoint> GetTargetEndPointAsync(HostString host)
+        private async IAsyncEnumerable<EndPoint> GetUpstreamEndPointsAsync(HostString host, [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             var targetHost = host.Host;
             var targetPort = host.Port ?? HTTPS_PORT;
 
             if (IPAddress.TryParse(targetHost, out var address) == true)
             {
-                return new IPEndPoint(address, targetPort);
+                yield return new IPEndPoint(address, targetPort);
             }
-
-            // 不关心的域名，直接使用系统dns
-            if (this.fastGithubConfig.IsMatch(targetHost) == false)
+            else if (this.fastGithubConfig.IsMatch(targetHost) == false)
             {
-                return new DnsEndPoint(targetHost, targetPort);
+                yield return new DnsEndPoint(targetHost, targetPort);
             }
-
-            if (targetPort == HTTP_PORT)
+            else if (targetPort == HTTP_PORT)
             {
-                return new IPEndPoint(IPAddress.Loopback, ReverseProxyPort.Http);
+                yield return new IPEndPoint(IPAddress.Loopback, GlobalListener.HttpPort);
             }
-
-            if (targetPort == HTTPS_PORT)
+            else if (targetPort == HTTPS_PORT)
             {
-                return new IPEndPoint(IPAddress.Loopback, ReverseProxyPort.Https);
+                yield return new IPEndPoint(IPAddress.Loopback, GlobalListener.HttpsPort);
             }
-
-            // 不使用系统dns
-            address = await this.domainResolver.ResolveAnyAsync(new DnsEndPoint(targetHost, targetPort));
-            return new IPEndPoint(address, targetPort);
+            else
+            {
+                var dnsEndPoint = new DnsEndPoint(targetHost, targetPort);
+                await foreach (var item in this.domainResolver.ResolveAsync(dnsEndPoint, cancellationToken))
+                {
+                    yield return new IPEndPoint(item, targetPort);
+                }
+            }
         }
 
         /// <summary>
